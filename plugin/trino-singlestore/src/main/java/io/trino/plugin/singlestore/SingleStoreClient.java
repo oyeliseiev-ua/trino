@@ -15,6 +15,7 @@ package io.trino.plugin.singlestore;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
+import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.trino.plugin.base.expression.ConnectorExpressionRewriter;
 import io.trino.plugin.base.mapping.IdentifierMapping;
@@ -24,7 +25,9 @@ import io.trino.plugin.jdbc.ColumnMapping;
 import io.trino.plugin.jdbc.ConnectionFactory;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcJoinCondition;
+import io.trino.plugin.jdbc.JdbcNamedRelationHandle;
 import io.trino.plugin.jdbc.JdbcSortItem;
+import io.trino.plugin.jdbc.JdbcSplit;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongReadFunction;
@@ -41,6 +44,8 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.ConnectorSplitSource;
+import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.connector.JoinStatistics;
 import io.trino.spi.connector.JoinType;
@@ -59,19 +64,23 @@ import io.trino.spi.type.VarcharType;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.BiFunction;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -142,6 +151,8 @@ import static java.util.stream.Collectors.joining;
 public class SingleStoreClient
         extends BaseJdbcClient
 {
+    private static final Logger log = Logger.get(SingleStoreClient.class);
+
     static final int SINGLESTORE_DATE_TIME_MAX_PRECISION = 6;
     static final int SINGLESTORE_VARCHAR_MAX_LENGTH = 21844;
     static final int SINGLESTORE_TEXT_MAX_LENGTH = 65535;
@@ -158,11 +169,16 @@ public class SingleStoreClient
 
     private final Type jsonType;
     private final ConnectorExpressionRewriter<ParameterizedExpression> connectorExpressionRewriter;
+    private final SingleStoreConfig singleStoreConfig;
+    private final SingleStoreQueryBuilder singleStoreQueryBuilder;
+    private final SingleStoreResultTableConnectionFactory resultTableConnectionFactory;
 
     @Inject
     public SingleStoreClient(
             BaseJdbcConfig config,
+            SingleStoreConfig singleStoreConfig,
             ConnectionFactory connectionFactory,
+            SingleStoreResultTableConnectionFactory resultTableConnectionFactory,
             QueryBuilder queryBuilder,
             TypeManager typeManager,
             IdentifierMapping identifierMapping,
@@ -170,7 +186,9 @@ public class SingleStoreClient
     {
         this(
                 config,
+                singleStoreConfig,
                 connectionFactory,
+                resultTableConnectionFactory,
                 queryBuilder,
                 typeManager,
                 identifierMapping,
@@ -180,7 +198,9 @@ public class SingleStoreClient
 
     protected SingleStoreClient(
             BaseJdbcConfig config,
+            SingleStoreConfig singleStoreConfig,
             ConnectionFactory connectionFactory,
+            SingleStoreResultTableConnectionFactory resultTableConnectionFactory,
             QueryBuilder queryBuilder,
             TypeManager typeManager,
             IdentifierMapping identifierMapping,
@@ -189,8 +209,9 @@ public class SingleStoreClient
     {
         super("`", connectionFactory, queryBuilder, config.getJdbcTypesMappedToVarchar(), identifierMapping, queryModifier, supportsRetries);
         requireNonNull(typeManager, "typeManager is null");
+        this.singleStoreConfig = singleStoreConfig;
+        this.singleStoreQueryBuilder = (SingleStoreQueryBuilder) queryBuilder;
         this.jsonType = typeManager.getType(new TypeSignature(StandardTypes.JSON));
-
         this.connectorExpressionRewriter = JdbcConnectorExpressionRewriterBuilder.newBuilder()
                 .addStandardRules(this::quoted)
                 // No "real" on the list; pushdown on REAL is disabled also in toColumnMapping
@@ -203,6 +224,7 @@ public class SingleStoreClient
                 .map("$greater_than(left: numeric_type, right: numeric_type)").to("left > right")
                 .map("$greater_than_or_equal(left: numeric_type, right: numeric_type)").to("left >= right")
                 .build();
+        this.resultTableConnectionFactory = resultTableConnectionFactory;
     }
 
     @Override
@@ -255,6 +277,58 @@ public class SingleStoreClient
             }
         }
         execute(session, connection, "DROP SCHEMA " + quoted(remoteSchemaName));
+    }
+
+    @Override
+    public PreparedStatement buildSql(ConnectorSession session, Connection connection, JdbcSplit split, JdbcTableHandle table, List<JdbcColumnHandle> columns)
+            throws SQLException
+    {
+        if (isEligibleForParallelRead(table)){
+            final String schemaName = ((JdbcNamedRelationHandle) table.getRelationHandle()).getSchemaTableName().getSchemaName();
+            connection.createStatement().execute("USE " + schemaName);
+            PreparedQuery preparedQuery = singleStoreQueryBuilder.prepareSelectQueryFromResultTable(this, split);
+            return singleStoreQueryBuilder.prepareStatement(this, session, connection, preparedQuery, Optional.of(columns.size()));
+        }
+        return super.buildSql(session, connection, split, table, columns);
+    }
+
+    @Override
+    public ConnectorSplitSource getSplits(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        if (isEligibleForParallelRead(tableHandle)) {
+            return new FixedSplitSource(createResultTableAndSplitByPartitions(session, tableHandle));
+        }
+        return super.getSplits(session, tableHandle);
+    }
+
+    private boolean isEligibleForParallelRead(JdbcTableHandle tableHandle) {
+        return singleStoreConfig.isEnableParallelRead() &&
+                tableHandle.getLimit().isEmpty() && tableHandle.getSortOrder().isEmpty();
+    }
+
+    public List<SingleStoreSplit> createResultTableAndSplitByPartitions(ConnectorSession session, JdbcTableHandle tableHandle) {
+        final String schemaName = ((JdbcNamedRelationHandle) tableHandle.getRelationHandle()).getSchemaTableName().getSchemaName();
+        final String tableName = ((JdbcNamedRelationHandle) tableHandle.getRelationHandle()).getRemoteTableName().getTableName() + "_result_table";
+        final List<JdbcColumnHandle> columns = tableHandle.getColumns().orElse(Collections.emptyList());
+        int numPartitions = 1;
+        try (Connection connection = resultTableConnectionFactory.getConnectionForTable(session, quoted(null, schemaName, tableName));
+                Statement statement = connection.createStatement()) {
+            PreparedQuery preparedQuery = singleStoreQueryBuilder.prepareResultTable(tableName, this,
+                    session, connection, tableHandle.getRelationHandle(),
+                    columns,
+                    tableHandle.getConstraint());
+            PreparedStatement resultTableStatement = singleStoreQueryBuilder.prepareStatement(this, session, connection, preparedQuery, Optional.of(columns.size()));
+            resultTableStatement.execute();
+            final String query = String.format("SELECT num_partitions FROM information_schema.DISTRIBUTED_DATABASES WHERE database_name = '%s';", schemaName);
+            ResultSet rs = statement.executeQuery(query);
+            if (rs.next()) {
+                numPartitions = rs.getInt(1);
+            }
+            return IntStream.range(0, numPartitions).mapToObj(i -> new SingleStoreSplit(tableName, i)).toList();
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
     }
 
     @Override

@@ -104,7 +104,6 @@
         <dependency>
             <groupId>io.airlift</groupId>
             <artifactId>log</artifactId>
-            <scope>runtime</scope>
         </dependency>
 
         <dependency>
@@ -210,6 +209,10 @@
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.trino</groupId>
+            <artifactId>trino-main</artifactId>
         </dependency>
     </dependencies>
 </project>
