@@ -82,7 +82,10 @@ public class SingleStoreQueryRunner
         DistributedQueryRunner queryRunner = createSingleStoreQueryRunner(
                 new TestingSingleStoreServer(),
                 ImmutableMap.of("http-server.http.port", "8080"),
-                ImmutableMap.of(),
+                ImmutableMap.of("singlestore.enableParallelRead", "true",
+                        "singlestore.parallelRead.materialized", "false",
+                        "singlestore.parallelRead.repartition", "false",
+                        "singlestore.parallelRead.repartition.columns", "name, acctbal"),
                 TpchTable.getTables());
 
         Logger log = Logger.get(SingleStoreQueryRunner.class);

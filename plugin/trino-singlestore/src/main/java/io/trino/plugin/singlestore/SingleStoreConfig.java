@@ -14,16 +14,23 @@
 
 package io.trino.plugin.singlestore;
 
+import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.LegacyConfig;
 import io.airlift.units.Duration;
 import jakarta.validation.constraints.NotNull;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 public class SingleStoreConfig
 {
     private boolean autoReconnect = true;
+    private boolean enableParallelRead = false;
+    private boolean materializedParallelRead = false;
+    private boolean repartitionParallelRead = false;
+    private List<String> parallelReadRepartitionColumns = ImmutableList.of();
     private Duration connectionTimeout = new Duration(10, TimeUnit.SECONDS);
 
     public boolean isAutoReconnect()
@@ -50,6 +57,54 @@ public class SingleStoreConfig
     public SingleStoreConfig setConnectionTimeout(Duration connectionTimeout)
     {
         this.connectionTimeout = connectionTimeout;
+        return this;
+    }
+
+    public boolean isEnableParallelRead()
+    {
+        return enableParallelRead;
+    }
+
+    @Config("singlestore.enableParallelRead")
+    public SingleStoreConfig setEnableParallelRead(boolean enableParallelRead)
+    {
+        this.enableParallelRead = enableParallelRead;
+        return this;
+    }
+
+    public boolean isMaterializedParallelRead()
+    {
+        return materializedParallelRead;
+    }
+
+    @Config("singlestore.parallelRead.materialized")
+    public SingleStoreConfig setMaterializedParallelRead(boolean materializedParallelRead)
+    {
+        this.materializedParallelRead = materializedParallelRead;
+        return this;
+    }
+
+    public boolean isRepartitionParallelRead()
+    {
+        return repartitionParallelRead;
+    }
+
+    @Config("singlestore.parallelRead.repartition")
+    public SingleStoreConfig setRepartitionParallelRead(boolean repartitionParallelRead)
+    {
+        this.repartitionParallelRead = repartitionParallelRead;
+        return this;
+    }
+
+    public List<String> getParallelReadRepartitionColumns()
+    {
+        return parallelReadRepartitionColumns;
+    }
+
+    @Config("singlestore.parallelRead.repartition.columns")
+    public SingleStoreConfig setParallelReadRepartitionColumns(String parallelReadRepartitionColumns)
+    {
+        this.parallelReadRepartitionColumns = Splitter.on(',').trimResults().omitEmptyStrings().splitToList(parallelReadRepartitionColumns);
         return this;
     }
 }
